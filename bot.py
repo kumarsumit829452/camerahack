@@ -20,7 +20,7 @@ CORS(app)
 # in-memory token store
 active_tokens = {}
 
-# telegram application
+# telegram application (module-level)
 tg_app = None
 
 
@@ -126,39 +126,37 @@ def upload_photo():
 # ==================== WEBHOOK ====================
 @app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
 def webhook():
-    global tg_app
     try:
         update_data = request.get_json(force=True)
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         async def process():
             if tg_app is None:
                 return
             update = Update.de_json(update_data, tg_app.bot)
             await tg_app.initialize()
             await tg_app.process_update(update)
-        
+
         loop.run_until_complete(process())
         loop.close()
-        
+
     except Exception as e:
         print(f"Webhook error: {e}")
-    
+
     return "OK", 200
 
 
 # ==================== SETUP WEBHOOK ====================
 def set_telegram_webhook():
-    """Set webhook URL on Telegram"""
     if not RENDER_URL:
         print("RENDER_EXTERNAL_URL not set — skipping webhook setup")
         return
-    
+
     import requests
     webhook_url = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
-    
+
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
@@ -172,16 +170,12 @@ def set_telegram_webhook():
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    global tg_app
-    # telegram app initialize
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
-    
+
     print("🤖 Bot initialized (webhook mode)")
-    
-    # set webhook
+
     set_telegram_webhook()
-    
-    # start flask
+
     app.run(host='0.0.0.0', port=PORT)
