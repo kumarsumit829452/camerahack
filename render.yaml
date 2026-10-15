@@ -10,5 +10,7 @@ services:
         sync: false
       - key: SITE_URL
         sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.9
