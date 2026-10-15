@@ -2,7 +2,7 @@ import os
 import base64
 import uuid
 import asyncio
-import sqlite3
+import psycopg2
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 PORT = int(os.getenv('PORT', 10000))
 SITE_URL = os.getenv('SITE_URL', 'https://your-site.netlify.app')
 RENDER_URL = os.getenv('RENDER_EXTERNAL_URL', '')
-DB_PATH = "/tmp/tokens.db"
+DATABASE_URL = os.environ['DATABASE_URL']
 
 app = Flask(__name__)
 CORS(app)
@@ -22,39 +22,61 @@ CORS(app)
 tg_app = None
 
 
-# ==================== TOKEN DATABASE ====================
+# ==================== DATABASE ====================
+def db_conn():
+    url = DATABASE_URL
+    if url.startswith('postgres://'):
+        url = url.replace('postgres://', 'postgresql://', 1)
+    return psycopg2.connect(url)
+
+
 def init_token_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER,
-            created TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS tokens (
+                token VARCHAR(64) PRIMARY KEY,
+                user_id BIGINT,
+                created TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Token table ready")
+    except Exception as e:
+        print(f"DB init error: {e}")
 
 
 def save_token(token, user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO tokens VALUES (?,?,?)',
-              (token, user_id, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute(
+            '''INSERT INTO tokens (token, user_id, created) 
+               VALUES (%s, %s, %s)
+               ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id''',
+            (token, user_id, datetime.now(timezone.utc))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save token error: {e}")
 
 
 def get_token_user(token):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT user_id FROM tokens WHERE token=?', (token,))
-        r = c.fetchone()
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM tokens WHERE token=%s', (token,))
+        r = cur.fetchone()
+        cur.close()
         conn.close()
         return r[0] if r else None
-    except Exception:
+    except Exception as e:
+        print(f"Get token error: {e}")
         return None
 
 
@@ -160,7 +182,6 @@ def upload_photo():
 def webhook():
     try:
         update_data = request.get_json(force=True)
-
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
@@ -173,10 +194,8 @@ def webhook():
 
         loop.run_until_complete(process())
         loop.close()
-
     except Exception as e:
         print(f"Webhook error: {e}")
-
     return "OK", 200
 
 
@@ -185,10 +204,8 @@ def set_telegram_webhook():
     if not RENDER_URL:
         print("RENDER_EXTERNAL_URL not set")
         return
-
     import requests
     webhook_url = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
-
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
@@ -208,7 +225,7 @@ if __name__ == '__main__':
     tg_app.add_handler(CommandHandler('start', start))
     tg_app.add_handler(CallbackQueryHandler(genlink, pattern='genlink'))
 
-    print("🤖 Bot initialized (webhook mode)")
+    print("🤖 Bot initialized (PostgreSQL mode)")
 
     set_telegram_webhook()
 
